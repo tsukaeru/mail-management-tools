@@ -29,4 +29,4 @@ Please see each scripts' help for more details
 ## License
 These scripts are licensed under MIT. See the [LICENSE][license] file for details.
 
-[license]: https://github.com/tsukaeru/mail-management-scripts/blob/master/LICENSE
+[license]: https://github.com/tsukaeru/mail-management-tools/blob/master/LICENSE
