@@ -1,0 +1,592 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+no warnings qw(once);
+
+use Getopt::Std;
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+
+$main::VERSION = '0.0.3';
+
+my $queue = '/var/qmail/queue';
+my $ps_cmd = 'ps aux';
+my $debug = 0;
+
+$queue =~ s#/+$##;
+my $bigtodo = -d "$queue/todo/0";
+
+if ($#ARGV == -1) {
+    HELP_MESSAGE();
+    exit;
+}
+
+my %current = ();
+my %opts = ();
+getopts("AdhLlRsTtv", \%opts);
+my $match_statement = parse_expression();
+my $processed = 0;
+
+if ($opts{'v'}) {
+    VERSION_MESSAGE();
+} elsif ($opts{'h'}) {
+    HELP_MESSAGE();
+} elsif ($opts{'s'}) {
+    statistics();
+} elsif ($opts{'l'}) {
+    if ($opts{'A'} || $opts{'L'} || $opts{'R'} || $opts{'T'}) {
+        process_queue('list', 'local') if $opts{'A'} || $opts{'L'};
+        process_queue('list', 'remote') if $opts{'A'} || $opts{'R'};
+        process_queue('list', 'todo') if $opts{'A'} || $opts{'T'};
+    }
+} elsif ($opts{'d'} || $opts{'t'}) {
+    if ($opts{'t'}) {
+        $debug = 1;
+    }
+    if ($opts{'A'} || $opts{'L'} || $opts{'R'} || $opts{'T'}) {
+        if (!$debug && is_running_qmail()) {
+            print "Some qmail programs are running. " .
+                  "Please stop them before start " .
+                  basename($0) . " because it may break the queue\n" .
+                  "Continue? (y/N):";
+            my $continue = <STDIN>;
+            chomp $continue;
+            if ($continue ne 'y') {
+                print "Exit " . basename($0) . "\n";
+                exit;
+            }
+        }
+        print "$match_statement\n" if $debug;
+        $SIG{'INT'} = $SIG{'QUIT'} = $SIG{'TERM'} = \&delete_before_exit;
+        process_queue('delete', 'local') if $opts{'A'} || $opts{'L'};
+        process_queue('delete', 'remote') if $opts{'A'} || $opts{'R'};
+        process_queue('delete', 'todo') if $opts{'A'} || $opts{'T'};
+        $SIG{'INT'} = $SIG{'QUIT'} = $SIG{'TERM'} = 'DEFAULT';
+        print "Delete $processed messages\n";
+    }
+}
+
+exit;
+
+sub is_running_qmail {
+    my %qmail_cmds = ('qmail-send' => 'qmails', 'qmail-smtpd' => 'qmaild',
+                      'qmail-remote' => 'qmailr', 'qmail-local' => '.');
+    if ($ps_cmd) {
+        my $ps = `$ps_cmd`;
+        foreach my $cmd (keys %qmail_cmds) {
+            my $pattern = '\s*' . $qmail_cmds{$cmd} . '.*?' . $cmd;
+            if ($ps =~ /$pattern/s) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+sub parse_expression {
+    my $result = '';
+    my %exp = ('file' => 1, 'sender' => 1, 'recipt' => 1,
+               'header' => 1, 'body' => 1, 'any' => 1);
+    my %op = ('and' => '&&', 'or' => '||');
+    my $count = 0;
+    my $syntax = 0;
+
+    if ($ARGV[0] && $ARGV[0] eq 'all') {
+        return 1;
+    }
+    foreach (@ARGV) {
+        chomp;
+        $count++;
+        $syntax = $count % 3;
+        if ($syntax == 1) {
+            if (defined $exp{$_} && $ARGV[$count]) {
+                $result .= "search_$_(";
+            } else {
+                print "Syntax error: $_\n";
+                exit;
+            }
+        } elsif ($syntax == 2) {
+            s/\\$/\\\$/;
+            s/(?<!\\)'/\\'/g;
+            s#(?<!\\)/#\\/#g;
+            $result .= "'$_', \$msginfo)";
+        } else {
+            if (defined $op{$_} && $ARGV[$count]) {
+                $result .= " $op{$_} ";
+            } else {
+                print "Syntax error: $_\n";
+                exit;
+            }
+        }
+    }
+    return $result;
+}
+
+sub search_file {
+    my ($pattern, $msginfo) = @_;
+    return ($msginfo->{'file'} =~ /$pattern/);
+}
+
+sub search_sender {
+    my ($pattern, $msginfo) = @_;
+    my $type = $msginfo->{'dir'};
+    my ($path, $sender) = ('', '');
+    my $dir = $type eq 'todo' ? 'todo' : 'info';
+
+    if ($type eq 'local' || $type eq 'remote' ||
+            ($type eq 'todo' && $bigtodo)) {
+        $path = $msginfo->{'subdir'} . '/' . $msginfo->{'file'};
+    } elsif ($type eq 'todo') {
+        $path = $msginfo->{'file'};
+    } else {
+        return 0;
+    }
+    if(open SENDER, "$queue/$dir/$path") {
+        $sender = <SENDER>;
+        close SENDER;
+        chop $sender;
+        if ($type eq 'todo') {
+            $sender =~ /^u[^\0]*\0p[^\0]*\0F([^\0]*)\0/;
+            $sender = $1;
+        } else {
+            $sender = substr $sender, 1;
+        }
+    }
+    return ($sender && $sender =~ /$pattern/);
+}
+
+sub search_recipt {
+    my ($pattern, $msginfo) = @_;
+    my $type = $msginfo->{'dir'};
+    my ($path, $recipts) = ('', '');
+
+    if ($type eq 'local' || $type eq 'remote' ||
+            ($type eq 'todo' && $bigtodo)) {
+        $path = $msginfo->{'subdir'} . '/' . $msginfo->{'file'};
+    } elsif ($type eq 'todo') {
+        $path = $msginfo->{'file'};
+    } else {
+        return 0;
+    }
+    if (open RECIPT, "$queue/$type/$path") {
+        $recipts = <RECIPT>;
+        close RECIPT;
+        chop $recipts;
+        if ($type eq 'todo') {
+            $recipts =~ /^u[^\0]*\0p[^\0]*\0F[^\0]*\0(T.*)/;
+            $recipts = $1;
+        }
+    }
+    return grep /$pattern/, map {substr $_, 1} split /\0/, $recipts;
+}
+
+sub search_header {
+    my ($pattern, $msginfo) = @_;
+    my $regex = qr/$pattern/;
+    my $result = 0;
+    my $path = "$queue/mess/" . $msginfo->{'subdir'} .
+                   "/" . $msginfo->{'file'};
+    if (open MESS, $path) {
+        while (<MESS>) {
+            last if $_ eq "\n";
+            if (/$pattern/) {
+                $result = 1;
+                last;
+            }
+        }
+        close MESS;
+    }
+    return $result;
+}
+
+sub search_body {
+    my ($pattern, $msginfo) = @_;
+    my $regex = qr/$pattern/;
+    my $result = 0;
+    my $path = "$queue/mess/" . $msginfo->{'subdir'} .
+                   "/" . $msginfo->{'file'};
+    if (open MESS, $path) {
+        while (<MESS>) {
+            last if $_ eq "\n";
+        }
+        while (<MESS>) {
+            if (/$regex/) {
+                $result = 1;
+                last;
+            }
+        }
+        close MESS;
+    }
+    return $result;
+}
+
+sub search_any {
+    my ($pattern, $msginfo) = @_;
+    return (search_sender($pattern, $msginfo) ||
+            search_recipt($pattern, $msginfo) ||
+            search_header($pattern, $msginfo) ||
+            search_body($pattern, $msginfo));
+}
+
+sub statistics {
+    my @subdir_list = subdir_list();
+
+    my $total = count_queue('mess', \@subdir_list);
+    my $local = count_queue('local', \@subdir_list);
+    my $remote = count_queue('remote', \@subdir_list);
+    my $bounce = count_queue('bounce');
+    my $todo = 0;
+    if ($bigtodo) {
+        $todo = count_queue('todo', \@subdir_list);
+    } else {
+        $todo = count_queue('todo');
+    }
+    my $unknown = $total - $local - $remote - $todo;
+
+    my $result = <<_STAT_;
+Total messages: $total
+   local queue: $local
+  remote queue: $remote
+    todo queue: $todo
+  bounce queue: $bounce
+_STAT_
+    $result .= "       unknown: $unknown\n" if $unknown;
+    print $result;
+}
+
+sub subdir_list {
+    my @result = ();
+    opendir MESS, "$queue/mess";
+    @result = grep !/^\./, readdir MESS;
+    closedir MESS;
+    return @result;
+}
+
+sub count_queue {
+    my ($dir, $dir_list_ref) = @_;
+
+    my $result = 0;
+    if ($dir_list_ref) {
+        foreach my $subdir (@$dir_list_ref) {
+            opendir DIR, "$queue/$dir/$subdir";
+            while (my $entry = readdir DIR) {
+                $result++ if $entry !~ /^\./;
+            }
+            closedir DIR;
+        }
+    } else {
+        opendir DIR, "$queue/$dir";
+        while (my $entry = readdir DIR) {
+            $result++ if $entry !~ /^\./;
+        }
+        closedir DIR;
+    }
+    return $result;
+}
+
+sub process_queue {
+    my ($mode, $dir) = @_;
+    if ($dir eq 'todo' && !$bigtodo) {
+        process_messages($mode, $dir);
+    } else {
+        my @subdir_list = subdir_list();
+        my $subdirs = @subdir_list;
+        foreach my $subdir (@subdir_list) {
+            process_messages($mode, $dir, $subdir);
+        }
+    }
+}
+
+sub process_messages {
+    my ($mode, $dir, $subdir) = @_;
+    my $subdirs = subdir_list();
+    my $process_dir = defined $subdir
+                          ? "$queue/$dir/$subdir"
+                          : "$queue/$dir";
+
+    opendir DIR, $process_dir;
+    while (my $file = readdir DIR) {
+        if ($file =~ /^\./) {
+            next;
+        }
+        my %msginfo = ('file' => $file, 'dir' => $dir);
+        $msginfo{'subdir'} = defined $subdir
+                                 ? $subdir
+                                 : $file % $subdirs;
+        if ($mode eq 'list') {
+            msg_envelope(\%msginfo);
+            msg_header(\%msginfo);
+            output_list(\%msginfo);
+        } elsif ($mode eq 'delete') {
+            delete_message(\%msginfo);
+        }
+    }
+    closedir DIR;
+}
+
+sub msg_envelope {
+    my $msginfo = shift;
+    my $type = $msginfo->{'dir'};
+
+    if ($type eq 'local' || $type eq 'remote') {
+        my $sender = '';
+        my $recipients = '';
+        my $path = $msginfo->{'subdir'} . '/' . $msginfo->{'file'};
+
+        if (open INFO, "$queue/info/$path") {
+            $sender = <INFO>;
+            close INFO;
+            chop $sender;
+            $msginfo->{'sender'} = substr $sender, 1;
+        } else {
+            $msginfo->{'sender'} = '';
+        }
+
+        if (open RECIPT, "$queue/$type/$path") {
+            $recipients = <RECIPT>;
+            close RECIPT;
+            chop $recipients;
+            $msginfo->{'recipients'} = [split /\0/, $recipients];
+        } else {
+            $msginfo->{'recipients'} = [''];
+        }
+    } elsif ($type eq 'todo') {
+        my $todo = '';
+        my $path = $bigtodo
+                       ? $msginfo->{'subdir'} . '/' . $msginfo->{'file'}
+                       : $msginfo->{'file'};
+
+        if(open TODO, "$queue/todo/$path") {
+            $todo = <TODO>;
+            close TODO;
+            chop $todo;
+            $todo =~ /^u[^\0]*\0p[^\0]*\0F([^\0]*)\0(T.*)/;
+            $msginfo->{'sender'} = $1 ? $1 : '';
+            $msginfo->{'recipients'} = [split /\0/, $2];
+        } else {
+            $msginfo->{'sender'} = '';
+            $msginfo->{'recipients'} = [''];
+        }
+    }
+}
+
+sub msg_header {
+    my $msginfo = shift;
+    my $path = $msginfo->{'subdir'} . '/' . $msginfo->{'file'};
+
+    $msginfo->{'size'} = -s "$queue/mess/$path" || 0;
+    if (open MSG, "$queue/mess/$path") {
+        while (<MSG>) {
+            if ($_ eq "\n") {
+                last;
+            }
+            chomp $_;
+            $msginfo->{'from'} = $_ if /^[fF]rom:/ && !$msginfo->{'from'};
+            $msginfo->{'to'} = $_ if /^[tT]o:/ && !$msginfo->{'to'};
+            $msginfo->{'cc'} = $_ if /^[cC]c:/ && !$msginfo->{'cc'};
+            $msginfo->{'date'} = $_ if /^[dD]ate:/ && !$msginfo->{'date'};
+            $msginfo->{'subject'} = $_ if /^[sS]ubject:/ &&
+                                          !$msginfo->{'subject'};
+            if ($msginfo->{'from'} && $msginfo->{'to'} && $msginfo->{'cc'} &&
+                    $msginfo->{'date'} && $msginfo->{'subject'}) {
+                last;
+            }
+        }
+        close MSG;
+    }
+}
+
+sub output_list {
+    my $msginfo = shift;
+    my $size = 0;
+    if ($msginfo->{'size'} > 1024 * 1024) {
+        $size = sprintf("%.2fMB", $msginfo->{'size'} / 1024 / 1024);
+    } elsif ($msginfo->{'size'} > 1024) {
+        $size = sprintf("%.2fKB", $msginfo->{'size'} / 1024);
+    } else {
+        $size = $msginfo->{'size'} . "B";
+    }
+    my $out = sprintf("%s (%s, %s, %s) %s/mess/%s/%s\n",
+                      $msginfo->{'file'}, $msginfo->{'subdir'},
+                      $msginfo->{'dir'}, $size,
+                      $queue, $msginfo->{'subdir'}, $msginfo->{'file'});
+    $out .= "  Envelope Sender: " . $msginfo->{'sender'} . "\n";
+    my $longest = 0;
+    my $recipients = $msginfo->{'recipients'};
+    foreach (@$recipients) {
+        my $len = length;
+        $longest = $len if $len > $longest;
+    }
+    foreach (@$recipients) {
+        my $status = /^D/ ? "(Done)" : "(To Be Delivered)";
+        $_ = substr $_, 1;
+        $out .= sprintf("  Envelope Recipients: %-${longest}s %s\n",
+                        $_, $status);
+    }
+    foreach my $header ('from', 'to', 'cc', 'date', 'subject') {
+        if ($msginfo->{$header}) {
+            $out .= "  " . ucfirst($msginfo->{$header}) ."\n";
+        }
+    }
+    print "$out\n";
+}
+
+sub delete_message {
+    my $msginfo = shift;
+    my $match = 0;
+    $match = eval $match_statement if $match_statement;
+    if ($match) {
+        my @subdir_queue = ('mess', 'info', 'intd', 'local', 'remote');
+        my @no_subdir_queue = ('bounce');
+        my $path = $msginfo->{'subdir'} . "/" . $msginfo->{'file'};
+        my $nosub_path = $msginfo->{'file'};
+        push @subdir_queue, 'todo' if $bigtodo;
+        push @no_subdir_queue, 'todo' unless $bigtodo;
+        %current = ('dirs' => \@subdir_queue, 'nosub_dirs' => \@no_subdir_queue,
+                    'path' => $path, 'nosub_path' => $nosub_path);
+        foreach my $dir (@subdir_queue) {
+            unlink "$queue/$dir/$path"
+                if -f "$queue/$dir/$path" && !$debug;
+            print "Delete $queue/$dir/$path\n"
+                if -f "$queue/$dir/$path" && $debug;
+        }
+        foreach my $dir (@no_subdir_queue) {
+            unlink "$queue/$dir/$nosub_path"
+                if -f "$queue/$dir/$nosub_path" && !$debug;
+            print "Delete $queue/$dir/$nosub_path\n"
+                if -f "$queue/$dir/$nosub_path" && $debug;
+        }
+        %current = ();
+        $processed++;
+        print "\n" if $debug;
+    }
+}
+
+sub delete_before_exit {
+    print "enter sighandler\n";
+    if (%current) {
+        my $subdir_queue = $current{'dirs'};
+        my $no_subdir_queue = $current{'nosub_dirs'};
+        my $path = $current{'path'};
+        my $nosub_path = $current{'nosub_path'};
+        foreach my $dir (@$subdir_queue) {
+            unlink "$queue/$dir/$path"
+                if -f "$queue/$dir/$path" && !$debug;
+            print "Delete $queue/$dir/$path\n"
+                if -f "$queue/$dir/$path" && $debug;
+        }
+        foreach my $dir (@$no_subdir_queue) {
+            unlink "$queue/$dir/$nosub_path"
+                if -f "$queue/$dir/$nosub_path" && !$debug;
+            print "Delete $queue/$dir/$nosub_path\n"
+                if -f "$queue/$dir/$nosub_path" && $debug;
+        }
+    }
+    $processed++;
+    print "Delete $processed messages\n";
+    exit;
+}
+
+sub basename {
+    my $path = shift;
+    $path =~ s#.*/##;
+    return $path;
+}
+
+sub HELP_MESSAGE {
+    my $prog = basename($0);
+    VERSION_MESSAGE();
+    print <<_USAGE_;
+Usage: $prog [-hv]
+       $prog mode options...
+
+OPTIONS
+        -h      Show this help.
+        -v      Show this program version.
+
+MODES
+        -s      Show statistics.
+        -l      List messages.
+        -d      Delete messages.
+        -t      Same as the delete mode but only outputs debug messages, no
+                mail will be deleted.
+
+Queue options:
+        -A      Process all messages.
+        -L      Process local queue messages.
+        -R      Process remote queue messages.
+        -T      Process todo queue messages.
+
+        You can choose multiple queues. If you use '-L' and '-R',
+        $prog processes the messages in the local and remote queue.
+
+STATISTICS MODE
+        Usage: $prog -s
+
+        This mode counts all messages in the queue and show it.
+
+LIST MODE
+        Usage: $prog -l {-A|L|R|T}
+
+        This mode lists all messages in the queues which you choose.
+
+DELETE MODE
+        Usage: $prog -d {-A|L|R|T} expressions...
+
+        This mode deletes the messages which matches the expression. You can
+        also select target queues.
+
+        expression
+                selects which messages will be deleted. If no expression is
+                given, no messages will be deleted. The expression rules here:
+
+                target regexp [{and|or} target regexp]...
+
+                'target' specifies a target part of a message and 'regexp' is
+                a perl regular expression. $prog searches the target part
+                of a message by the regexp.
+
+                You can use multiple target and regexp pairs by using 'and' or
+                'or' operator. But sorry, you can't use a parenthesized group
+                expression.
+
+                target terms are below:
+
+                all     Select all messages in the queue. This target has no
+                        regexp and must be placed at the first expression. If
+                        'all' is appeared, any other expressions are ignored.
+
+                file    Select a message filename.
+
+                sender  Select a SMTP sender part of a message. A sender is
+                        often different from a 'from' header of a message.
+
+                recipt  Select a SMTP recipient part of a message. A recipient
+                        is often different from a 'to' header of a message.
+
+                header  Select a header part of a message.
+
+                body    Select a main part of a message.
+
+                any     Select any part of a message. It includes 'sender',
+                        'recipt', 'header' and 'body' part.
+
+DELETE TEST MODE
+        Usage: $prog -t {-A|L|R|T} expressions...
+
+        This mode is same as the delete mode. But this mode only outputs
+        debug messages, no mail will be deleted. This mode is useful to know
+        what mails will be deleted by the expressions.
+
+COPYRIGHT
+        Copyright 2009- Tsukaeru.net Co.,Ltd.
+
+LICENSE
+        This software is licensed under MIT.
+_USAGE_
+}
+
+sub VERSION_MESSAGE {
+    my $prog = basename($0);
+    print "$prog version $main::VERSION\n";
+}

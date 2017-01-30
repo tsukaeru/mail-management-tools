@@ -1,0 +1,766 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+pq-manage - Postfix queue manager
+
+=head1 SYNOPSIS
+
+  pq-manage -s
+  pq-manage -q {queue_type} [-ltd] [-f] [expressions...]
+  pq-manage [-hv]
+
+  Options:
+      -q, --queue         specify queue type
+      -s, --stat          statistics mode
+      -l, --list          list mode
+      -d, --delete        delete mode
+      -t, --test          test mode
+      -f, --full          show message body (only enabled with list mode)
+      -h, --help          show help
+      -v, --version       show version
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-s>, B<--stat>
+
+Run the command in statistics mode. It counts all messages in the queue and
+show the result.
+
+=item B<-q type,type...>, B<--queue=type,type...>
+
+Specified the queue which should be checked. The queue type string must be the
+one of the following list's ones.
+
+You can choose multiple queues with a comma separated queue name argument.
+
+=over 12
+
+=item all
+
+Process all messages
+
+=item maildrop
+
+Process "maildrop" queue messages. "maildrop" keeps messages which have been
+submitted via the Postfix "sendmail" command.
+
+=item hold
+
+Process "hold" queue messages. "hold" keeps messages which have been moved by
+administrative rules.
+
+=item incoming
+
+Process "incoming" queue messages. "incoming" keeps all new messages.
+
+=item active
+
+Process "active" queue messages. "active" keeps messages which are ready to be
+sent.
+
+=item deferred
+
+Process "deferred" queue messages. "deferred" keeps messages which have
+tried to deliver but some recipients delivery failed for a transient reason
+(it might succeed later).
+
+=back
+
+=item B<-l>, B<--list>
+
+Run the command in list mode. It lists all messages in the queues which you
+choose.
+
+=item B<-d>, B<--delete>
+
+Run the command in delete mode. It deletes the messages which matches the
+expression. Please see L</EXPRESSION> section for more detail.
+
+You can also select target queues in this mode. Please see C<--queue> option
+description to learn what queue can be used with this.
+
+=item B<-t>, B<--test>
+
+Run the command in test mode. It works as same as C<--delete> mode but this
+mode only outputs debug messages. No mails will be deleted. This mode is
+useful to know what mails will be deleted by the expressions.
+
+=item B<-f>, B<--full>
+
+Show a full message header and body of each messages. This only work with
+'list' mode. In other mode, it is just ignored.
+
+=item B<-h>, B<--help>
+
+show help
+
+=item B<-v>, B<--version>
+
+show version
+
+=back
+
+=head1 DESCRIPTION
+
+B<This program> is Postfix queue manager to make getting stat, list, delete
+and test queue easy. In delete and test mode, it understands filterling
+expression. Please see the following L</EXPRESSION> section.
+
+=head1 EXPRESSION
+
+Expression filters messages to be applied an action. If no expression is
+given, no messages will be choosen. The expression rule is:
+
+target regexp [{and|or} target regexp]...
+
+'target' specifies a target part of a message and 'regexp' is a perl regular
+expression. This program searches the target part of a message by the regexp.
+
+You can use multiple target and regexp pairs by using 'and' or 'or' operator.
+But sorry, you can't use a parenthesized group expression.
+
+target terms are below:
+
+=over 8
+
+=item all
+
+Select all messages in the queue. This target has no regexp and must be
+placed at the first expression. If 'all' is appeared, any other
+expressions are ignored.
+
+=item file
+
+Select a message filename.
+
+=item sender
+
+Select a SMTP sender part of a message. A sender is often different from
+a 'from' header of a message.
+
+=item recipt
+
+Select a SMTP recipient part of a message. A recipient is often different
+from a 'to' header of a message.
+
+=item header
+
+Select a header part of a message.
+
+=item body
+
+Select a main part of a message.
+
+=item any
+
+Select any part of a message. It includes 'sender', 'recipt', 'header' and
+'body' part.
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright 2016- Tsukaeru.net Co.,Ltd.
+
+=head1 LICENSE
+
+This software is licensed under MIT.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(
+    :config posix_default no_ignore_case bundling auto_help auto_version
+);
+use Pod::Usage;
+use File::Find;
+
+our $VERSION = '0.00001';
+
+use constant REC_TYPE_ENVELOPE => 'MCTcFILSDRO/WVA>K<ion';
+use constant {
+    REC_TYPE_SIZE  => 'C', # first record, created by cleanup
+    REC_TYPE_TIME  => 'T', # arrival time, required
+    REC_TYPE_CTIME => 'c', # create time, optional
+    REC_TYPE_FULL  => 'F', # full name, optional
+    REC_TYPE_INSP  => 'I', # inspector transport
+    REC_TYPE_FILT  => 'L', # loop filter transport
+    REC_TYPE_FROM  => 'S', # sender, required
+    REC_TYPE_DONE  => 'D', # delivered recipient, optional
+    REC_TYPE_RCPT  => 'R', # todo recipient, optional
+    REC_TYPE_ORCP  => 'O', # original recipient, optional
+    REC_TYPE_DRCP  => '/', # canceled recipient, optional
+    REC_TYPE_WARN  => 'W', # warning message time
+    REC_TYPE_ATTR  => 'A', # named attribute for extensions
+    REC_TYPE_KILL  => 'K', # killed record
+
+    REC_TYPE_RDR   => '>', # redirect target
+    REC_TYPE_FLGS  => 'f', # cleanup processing flags
+    REC_TYPE_DELAY => 'd', # cleanup delay upon arrival
+
+    REC_TYPE_MESG => 'M', # start message records
+
+    REC_TYPE_CONT => 'L', # long data record
+    REC_TYPE_NORM => 'N', # normal data record
+    REC_TYPE_DTXT => 'w', # padding (was: deleted data)
+
+    REC_TYPE_XTRA => 'X', # start extracted records
+
+    REC_TYPE_RRTO => 'r', # return-receipt, from headers
+    REC_TYPE_ERTO => 'e', # errors-to, from headers
+    REC_TYPE_PRIO => 'P', # priority
+    REC_TYPE_PTR  => 'p', # pointer indirection
+    REC_TYPE_VERP => 'V', # VERP delimiters
+
+    REC_TYPE_DSN_RET    => '<', # DSN full/hdrs
+    REC_TYPE_DSN_ENVID  => 'i', # DSN full/hdrs
+    REC_TYPE_DSN_ORCPT  => 'o', # DSN orig rcpt address
+    REC_TYPE_DSN_NOTIFY => 'n', # DSN notify flags
+
+    REC_TYPE_MILT_COUNT => 'm',
+
+    REC_TYPE_END => 'E', # terminator, required
+};
+use constant RECORD_TYPE_NAME => {
+    REC_TYPE_SIZE()       => "message_size",
+    REC_TYPE_TIME()       => "message_arrival_time",
+    REC_TYPE_CTIME()      => "queue_file_create_time",
+    REC_TYPE_FULL()       => "sender_fullname",
+    REC_TYPE_INSP()       => "content_inspector",
+    REC_TYPE_FILT()       => "content_filter",
+    REC_TYPE_FROM()       => "sender",
+    REC_TYPE_DONE()       => "done_recipient",
+    REC_TYPE_DRCP()       => "canceled_recipient",
+    REC_TYPE_RCPT()       => "recipient",
+    REC_TYPE_ORCP()       => "original_recipient",
+    REC_TYPE_WARN()       => "warning_message_time",
+    REC_TYPE_ATTR()       => "named_attribute",
+    REC_TYPE_PTR()        => "pointer_record",
+    REC_TYPE_KILL()       => "killed_record",
+    REC_TYPE_MESG()       => "message_content",
+    REC_TYPE_CONT()       => "unterminated_text",
+    REC_TYPE_NORM()       => "regular_text",
+    REC_TYPE_DTXT()       => "padding",
+    REC_TYPE_XTRA()       => "extracted_info",
+    REC_TYPE_RRTO()       => "return_receipt",
+    REC_TYPE_ERTO()       => "errors_to",
+    REC_TYPE_PRIO()       => "priority",
+    REC_TYPE_VERP()       => "verp_delimiters",
+    REC_TYPE_END()        => "message_end",
+    REC_TYPE_RDR()        => "redirect_to",
+    REC_TYPE_FLGS()       => "flags",
+    REC_TYPE_DSN_RET()    => "dsn_return_flags",
+    REC_TYPE_DSN_ENVID()  => "dsn_envelope_id",
+    REC_TYPE_DSN_ORCPT()  => "dsn_original_recipient",
+    REC_TYPE_DSN_NOTIFY() => "dsn_notify_flags",
+};
+
+my %valid_qtypes = (
+    all => 1, maildrop => 1, hold => 1, incoming => 1, active => 1,
+    deferred => 1,
+);
+
+my @qtypes;
+my %opts = (queue => sub {
+    @qtypes = split /,/, $_[1];
+    my $has_all = 0;
+    for my $qtype (@qtypes) {
+        die "No such a queue type ($qtype) is available"
+            unless exists $valid_qtypes{$qtype};
+        $has_all = 1 if $qtype eq "all";
+    }
+    if ($has_all) {
+        @qtypes = grep { $_ ne "all" } keys %valid_qtypes;
+    }
+});
+GetOptions(\%opts, qw(
+    queue|q=s stat|s list|l full|f test|t delete|d help|h version|v
+)) or pod2usage(1);
+pod2usage(-verbose => 2) if exists $opts{help} || !%opts;
+if (exists $opts{version}) {
+    $0 =~ /([^\/]+)$/;
+    print "$1 version $VERSION\n";
+    exit 0;
+}
+
+my $postconf = parse_postconf();
+my $ps_cmd = 'ps aux';
+my $debug = 0;
+
+my $match_statement = parse_expression();
+my $processed = 0;
+
+if ($opts{stat}) {
+    statistics();
+} elsif ($opts{list}) {
+    if (@qtypes) {
+        my $mode = $opts{full} ? 'fulllist' : 'list';
+        for my $qtype (@qtypes) {
+            process_queue($mode, $qtype);
+        }
+    }
+} elsif ($opts{delete} || $opts{test}) {
+    if ($opts{test}) {
+        $debug = 1;
+    }
+    if (@qtypes) {
+        if (!$debug && is_running_postfix()) {
+            print "Some postfix programs are running. " .
+                  "Please stop them before start " .
+                  basename($0) . " because it may break the queue\n" .
+                  "Continue? (y/N):";
+            my $continue = <STDIN>;
+            chomp $continue;
+            if (lc($continue) ne 'y') {
+                print "Exit " . basename($0) . "\n";
+                exit;
+            }
+        }
+        print "$match_statement\n" if $debug;
+        for my $qtype (@qtypes) {
+            process_queue('delete', $qtype);
+        }
+        print "Delete $processed messages\n";
+    }
+}
+
+exit;
+
+sub parse_postconf {
+    my %result;
+    my $buf = qx{postconf hash_queue_depth hash_queue_names queue_directory};
+    for my $line (split /\n/, $buf) {
+        my ($key, $value) = split /\s*=\s*/, $line;
+        if ($key eq "hash_queue_names") {
+            $result{$key} = [split /,\s*/, $value];
+        } else {
+            $result{$key} = $value;
+        }
+    }
+    $result{queue_directory} =~ s|/+$||;
+    return \%result;
+}
+
+sub is_running_postfix {
+    my %qmail_cmds = ('postfix/master' => 'root', 'pickup' => 'postfix',
+                      'qmgr' => 'postfix');
+    if ($ps_cmd) {
+        my $ps = `$ps_cmd`;
+        for my $cmd (keys %qmail_cmds) {
+            my $pattern = '\s*' . $qmail_cmds{$cmd} . '.*?' . $cmd;
+            if ($ps =~ /$pattern/s) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+sub parse_expression {
+    my $result = '';
+    my %exp = ('file' => 1, 'sender' => 1, 'recipt' => 1,
+               'header' => 1, 'body' => 1, 'any' => 1);
+    my %op = ('and' => '&&', 'or' => '||');
+    my $count = 0;
+    my $syntax = 0;
+
+    if ($ARGV[0] && $ARGV[0] eq 'all') {
+        return 1;
+    }
+    for my $word (@ARGV) {
+        chomp $word;
+        $count++;
+        $syntax = $count % 3;
+        if ($syntax == 1) {
+            if (defined $exp{$word} && $ARGV[$count]) {
+                $result .= "search_$word(";
+            } else {
+                print "Syntax error: $word\n";
+                exit;
+            }
+        } elsif ($syntax == 2) {
+            $word =~ s/\\$/\\\$/;
+            $word =~ s/(?<!\\)'/\\'/g;
+            $word =~ s#(?<!\\)/#\\/#g;
+            $result .= "'$word', \$msginfo)";
+        } else {
+            if (defined $op{$word} && $ARGV[$count]) {
+                $result .= " $op{$word} ";
+            } else {
+                print "Syntax error: $word\n";
+                exit;
+            }
+        }
+    }
+    return $result;
+}
+
+sub search_file {
+    my ($pattern, $msginfo) = @_;
+    return ($msginfo->{filename} =~ /$pattern/);
+}
+
+sub search_sender {
+    my ($pattern, $msginfo) = @_;
+    return ($msginfo->{sender} && $msginfo->{sender} =~ /$pattern/);
+}
+
+sub search_recipt {
+    my ($pattern, $msginfo) = @_;
+    return 0 unless $msginfo->{recipients};
+
+    my @recipients;
+    for my $type (qw(done todo original canceled)) {
+        push @recipients, @{ $msginfo->{recipients}->{$type} }
+            if $msginfo->{recipients}->{$type};
+    }
+    return grep /$pattern/, @recipients;
+}
+
+sub search_header {
+    my ($pattern, $msginfo) = @_;
+    my $regex = qr/$pattern/;
+    my $result = 0;
+
+    for my $line (split /\n/,
+        $msginfo->{ RECORD_TYPE_NAME->{REC_TYPE_MESG()} }
+    ) {
+        last unless $line;
+        if ($line =~ /$regex/) {
+            $result = 1;
+            last;
+        }
+    }
+
+    return $result;
+}
+
+sub search_body {
+    my ($pattern, $msginfo) = @_;
+    my $regex = qr/$pattern/;
+    my $result = 0;
+    my $in_body = 0;
+
+    for my $line (split /\n/,
+        $msginfo->{ RECORD_TYPE_NAME->{REC_TYPE_MESG()} }
+    ) {
+        $in_body = 1 unless $line;
+        next unless $in_body;
+        if ($line =~ /$regex/) {
+            $result = 1;
+            last;
+        }
+    }
+
+    return $result;
+}
+
+sub search_any {
+    my ($pattern, $msginfo) = @_;
+    return (search_sender($pattern, $msginfo) ||
+            search_recipt($pattern, $msginfo) ||
+            search_header($pattern, $msginfo) ||
+            search_body($pattern, $msginfo));
+}
+
+sub is_valid_mailfile {
+    my $path = shift;
+    my $name = basename($path);
+    return if $name !~ /^[A-F0-9]{6,}$/;
+
+    my @st = lstat($path);
+    return ($st[2] & 0733) == 0700;
+}
+
+sub statistics {
+    my $result = "";
+    my $total = 0;
+    for my $queue (grep { $_ ne "all" } keys %valid_qtypes) {
+        my $count = count_queue($queue);
+        $result .= sprintf "%9s queue: %d\n", $queue, $count;
+        $total += $count;
+    }
+    $result = " Total messages: $total\n" . $result;
+    print $result;
+}
+
+sub count_queue {
+    my $dir = shift;
+    my $count = 0;
+    find({
+        wanted => sub {
+            $count++ if -f $_ && is_valid_mailfile($_);
+        },
+        no_chdir => 1,
+    }, "$postconf->{queue_directory}/$dir");
+    return $count;
+}
+
+sub process_queue {
+    my ($mode, $dir) = @_;
+    find({
+        wanted => sub {
+            if (-f $_ && is_valid_mailfile($_)) {
+                my $msginfo = parse_message($_);
+                if ($msginfo) {
+                    $msginfo->{queue} = $dir;
+                    msg_header($msginfo);
+                    if ($mode eq "list") {
+                        output_list_simple($msginfo);
+                    } elsif ($mode eq "fulllist") {
+                        output_list_full($msginfo);
+                    } elsif ($mode eq "delete") {
+                        delete_message($msginfo);
+                    }
+                }
+            }
+        },
+        no_chdir => 1,
+    }, "$postconf->{queue_directory}/$dir");
+}
+
+sub parse_message {
+    my $file = shift;
+    my %msginfo;
+    $msginfo{path} = $file;
+    $msginfo{filename} = basename($file);
+
+    if (open my $fp, '<', $file) {
+        my $c;
+        my $first = 1;
+        my $in_message = 0;
+        while (defined($c = getc($fp))) { # Read Type char
+            if ($first) {
+                if (index(REC_TYPE_ENVELOPE, $c) < 0) {
+                    close $fp;
+                    print "$file is not Postfix queue file\n";
+                    return;
+                }
+                $first = 0;
+            }
+
+            # Read and parse a record length
+            my $len = 0;
+            for (my $shift = 0; ; $shift += 7) {
+                my $len_c;
+                unless (defined($len_c = getc($fp))) {
+                    print "Failed to read a record length from $file\n";
+                    return;
+                }
+                my $len_byte = ord($len_c);
+                $len |= ($len_byte & 0x7f) << $shift;
+                last if ($len_byte & 0x80) == 0;
+            }
+
+            # Read a record
+            my $buf = "";
+            if (read($fp, $buf, $len) != $len) {
+                print "Failed to read a record from $file\n";
+                return;
+            }
+
+            if ($c eq REC_TYPE_SIZE) {
+                $buf =~ /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/;
+                $msginfo{ RECORD_TYPE_NAME->{$c} } = {
+                    message_length => $1,
+                    data_offset    => $2,
+                    rcpt_count     => $3,
+                    qmgr_opts      => $4,
+                    content_length => $5,
+                };
+            } elsif ($c eq REC_TYPE_TIME) {
+                $msginfo{ RECORD_TYPE_NAME->{$c} }
+                    = [split /\s+/, $buf]; # [sec, usec]
+            } elsif ($c eq REC_TYPE_WARN) {
+                $msginfo{ RECORD_TYPE_NAME->{$c} } = int $buf;
+            } elsif ($c eq REC_TYPE_PTR) {
+                if ((my $pos = int $buf) > 0) {
+                    unless (seek $fp, $pos, 0) {
+                        print "Failed to seek $pos on $file\n";
+                        return;
+                    }
+                }
+            } elsif ($c eq REC_TYPE_CONT) {
+                $msginfo{ RECORD_TYPE_NAME->{REC_TYPE_MESG()} }
+                    .= $buf if $in_message;
+            } elsif ($c eq REC_TYPE_NORM) {
+                $msginfo{ RECORD_TYPE_NAME->{REC_TYPE_MESG()} }
+                    .= $buf . "\n" if $in_message;
+            } elsif ($c eq REC_TYPE_DTXT) {
+                # do nothing
+            } elsif ($c eq REC_TYPE_MESG) {
+                $in_message = 1;
+                $msginfo{ RECORD_TYPE_NAME->{$c} } = "";
+            } elsif ($c eq REC_TYPE_XTRA) {
+                $in_message = 0;
+            } elsif ($c eq REC_TYPE_END) {
+                last;
+            } elsif ($c eq REC_TYPE_ATTR) {
+                $msginfo{attributes} = {} if !defined $msginfo{attributes};
+                $buf =~ /\s*(\w+)\s*=\s*(\w+)/;
+                $msginfo{attributes}->{$1} = $2 if $1 && $2;
+            } elsif ($c eq REC_TYPE_DONE) {
+                $msginfo{recipients} = {} if !defined $msginfo{recipients};
+                $msginfo{recipients}->{done} = []
+                    if !defined $msginfo{recipients}->{done};
+                push @{ $msginfo{recipients}->{done} }, $buf;
+            } elsif ($c eq REC_TYPE_RCPT) {
+                $msginfo{recipients} = {} if !defined $msginfo{recipients};
+                $msginfo{recipients}->{todo} = []
+                    if !defined $msginfo{recipients}->{todo};
+                push @{ $msginfo{recipients}->{todo} }, $buf;
+            } elsif ($c eq REC_TYPE_ORCP) {
+                $msginfo{recipients} = {} if !defined $msginfo{recipients};
+                $msginfo{recipients}->{original} = []
+                    if !defined $msginfo{recipients}->{original};
+                push @{ $msginfo{recipients}->{original} }, $buf;
+            } elsif ($c eq REC_TYPE_DRCP) {
+                $msginfo{recipients} = {} if !defined $msginfo{recipients};
+                $msginfo{recipients}->{canceled} = []
+                    if !defined $msginfo{recipients}->{canceled};
+                push @{ $msginfo{recipients}->{canceled} }, $buf;
+            } else {
+                my $key = RECORD_TYPE_NAME->{$c};
+                $msginfo{$key} = $buf if $key;
+            }
+        }
+        close $fp;
+        if (!defined $msginfo{ RECORD_TYPE_NAME->{REC_TYPE_SIZE()} }) {
+            $msginfo{ RECORD_TYPE_NAME->{REC_TYPE_SIZE()} } = {
+                message_length => -s $file || 0,
+            };
+        }
+        return \%msginfo;
+    } else {
+        print "Failed to open mail file $file\n";
+        return;
+    }
+}
+
+sub msg_header {
+    my $msginfo = shift;
+
+    for my $line (split /\n/,
+        $msginfo->{ RECORD_TYPE_NAME->{REC_TYPE_MESG()} }
+    ) {
+        last unless $line;
+        chomp $line;
+        $msginfo->{'from'} = $line
+            if $line =~ /^[fF]rom:/ && !$msginfo->{'from'};
+        $msginfo->{'to'} = $line
+            if $line =~ /^[tT]o:/ && !$msginfo->{'to'};
+        $msginfo->{'cc'} = $line
+            if $line =~ /^[cC]c:/ && !$msginfo->{'cc'};
+        $msginfo->{'date'} = $line
+            if $line =~ /^[dD]ate:/ && !$msginfo->{'date'};
+        $msginfo->{'subject'} = $line
+            if $line =~ /^[sS]ubject:/ && !$msginfo->{'subject'};
+        last if $msginfo->{'from'} && $msginfo->{'to'} && $msginfo->{'cc'} &&
+                $msginfo->{'date'} && $msginfo->{'subject'};
+    }
+}
+
+sub build_output_base_string {
+    my $msginfo = shift;
+
+    my $size = $msginfo->{
+        RECORD_TYPE_NAME->{REC_TYPE_SIZE()} }->{message_length};
+    my $size_str;
+    if ($size > 1024 * 1024) {
+        $size_str = sprintf("%.2fMB", $size / 1024 / 1024);
+    } elsif ($size > 1024) {
+        $size_str = sprintf("%.2fKB", $size / 1024);
+    } else {
+        $size_str = $size . "B";
+    }
+
+    my $out = sprintf("%s (%s, %s) %s\n",
+                      $msginfo->{filename}, $msginfo->{queue}, $size_str,
+                      $msginfo->{path});
+    $out .= "  Envelope Sender: " . $msginfo->{'sender'} . "\n";
+
+    if ($msginfo->{recipients}) {
+        my $longest = 0;
+        for my $type (qw(done todo original canceled)) {
+            next unless $msginfo->{recipients}->{$type};
+            for my $rcpt (@{ $msginfo->{recipients}->{$type} }) {
+                my $len = length $rcpt;
+                $longest = $len if $len > $longest;
+            }
+        }
+
+        for my $type (qw(done todo original canceled)) {
+            next unless $msginfo->{recipients}->{$type};
+            for my $rcpt (@{ $msginfo->{recipients}->{$type} }) {
+                $out .= sprintf("  Envelope Recipients: %-${longest}s (%s)\n",
+                                $rcpt, $type);
+            }
+        }
+    }
+
+    for my $header (qw(from to cc date subject)) {
+        if ($msginfo->{$header}) {
+            $out .= "  " . ucfirst($msginfo->{$header}) ."\n";
+        }
+    }
+    return $out;
+}
+
+sub output_list_simple {
+    print build_output_base_string(shift), "\n";
+}
+
+sub output_list_full {
+    my $msginfo = shift;
+    my $out = build_output_base_string($msginfo);
+    $out .= "\n===== Start full message header and body ===================\n";
+    $out .= "\n";
+    $out .= $msginfo->{ RECORD_TYPE_NAME->{REC_TYPE_MESG()} };
+    $out .= "\n===== End full message header and body =====================\n";
+    $out .= "\n\n";
+    print $out;
+}
+
+sub delete_message {
+    my $msginfo = shift;
+    my $match = 0;
+    $match = eval $match_statement if $match_statement;
+    if ($match) {
+        for my $log_queue (qw(bounce defer trace)) {
+            my $path = "$postconf->{queue_directory}/$log_queue";
+            if (grep { $_ eq $log_queue } @{ $postconf->{hash_queue_names} }) {
+                my $subdir = substr $msginfo->{filename}, 0,
+                                    $postconf->{hash_queue_depth};
+                $path .= "/$subdir";
+            }
+            $path .= "/$msginfo->{filename}";
+            if (-f $path) {
+                if ($debug) {
+                    print "Delete $path\n"
+                } else {
+                    unlink $path;
+                }
+            }
+        }
+        if (-f $msginfo->{path}) {
+            if ($debug) {
+                print "Delete $msginfo->{path}\n"
+            } else {
+                unlink $msginfo->{path};
+            }
+        }
+        $processed++;
+        print "\n" if $debug;
+    }
+}
+
+sub basename {
+    my $path = shift;
+    $path =~ s|.*/||;
+    return $path;
+}
